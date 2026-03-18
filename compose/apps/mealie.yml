@@ -1,3 +1,4 @@
+# Reference only - the unified compose files in compose/ are used for deployment
 services:
   mealie:
     image: ghcr.io/mealie-recipes/mealie:latest

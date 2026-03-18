@@ -16,6 +16,7 @@ set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
 LANTERN_VERSION="0.1.0"
+PROJECT_NAME="lantern"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="/tmp/lantern-install-$(date +%Y%m%d-%H%M%S).log"
 MIN_RAM_MB=2048
@@ -153,7 +154,7 @@ load_config_values() {
   FAIL2BAN=$(config_value '.advanced.fail2ban' 'true')
   BACKUP_PATH=$(config_value '.backups.destinations[0].path' '/mnt/backups/lantern')
   BACKUP_SCHEDULE=$(config_value '.backups.schedule' '0 2 * * *')
-  COMPOSE_PROJECT_NAME=$(config_value '.advanced.compose_project_name' 'lantern')
+  COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 }
 
 # =============================================================================
@@ -289,6 +290,8 @@ setup_directories() {
     "$data_root/data/mealie/data"
     "$data_root/data/nextcloud/html"
     "$data_root/data/nextcloud/data"
+    "$data_root/data/nextcloud/mariadb"
+    "$data_root/data/nextcloud/redis"
     "$data_root/data/paperless/data"
     "$data_root/data/paperless/media"
     "$data_root/data/paperless/export"
@@ -373,7 +376,7 @@ generate_secrets() {
   local secrets_dir="${DATA_ROOT:-/srv/lantern}/secrets"
 
   # Generate passwords for each service
-  local services=(authentik postgres admin traefik)
+  local services=(authentik postgres admin traefik nextcloud_db nextcloud_db_root)
   for svc in "${services[@]}"; do
     local pw_file="$secrets_dir/${svc}_password"
     if [[ ! -f "$pw_file" ]]; then
@@ -401,6 +404,13 @@ generate_secrets() {
     log "Generated internal API key"
   fi
 
+  local authentik_api_token="$secrets_dir/authentik_api_token"
+  if [[ ! -f "$authentik_api_token" ]]; then
+    openssl rand -hex 32 > "$authentik_api_token"
+    chmod 600 "$authentik_api_token"
+    log "Generated Authentik API token"
+  fi
+
   ok "All secrets generated in $secrets_dir"
 }
 
@@ -413,6 +423,9 @@ generate_env_files() {
   local domain="${DOMAIN:-home.example.com}"
   local email="${EMAIL:-admin@example.com}"
   local tz="${TIMEZONE:-America/New_York}"
+  local authentik_admin_email
+
+  authentik_admin_email=$(config_value '.auth.admin.email' "$email")
 
   # ── Core .env ──
   cat > "$env_dir/core.env" <<EOF
@@ -431,6 +444,9 @@ TRAEFIK_LOG_LEVEL=WARN
 AUTHENTIK_SECRET_KEY=$(cat "$secrets_dir/authentik_secret_key")
 AUTHENTIK_POSTGRESQL__PASSWORD=$(cat "$secrets_dir/postgres_password")
 AUTHENTIK_ERROR_REPORTING__ENABLED=false
+AUTHENTIK_BOOTSTRAP_PASSWORD=$(cat "$secrets_dir/admin_password")
+AUTHENTIK_BOOTSTRAP_TOKEN=$(cat "$secrets_dir/authentik_api_token")
+AUTHENTIK_BOOTSTRAP_EMAIL=${authentik_admin_email}
 
 # Postgres (for authentik)
 POSTGRES_PASSWORD=$(cat "$secrets_dir/postgres_password")
@@ -439,8 +455,9 @@ POSTGRES_DB=authentik
 EOF
   chmod 600 "$env_dir/core.env"
 
-  # ── App .env files generated per-service ──
-  # These are created by the deploy_apps phase based on enabled apps
+  for app in jellyfin immich nextcloud filebrowser mealie paperless; do
+    generate_app_env "$app"
+  done
 
   ok "Environment files generated"
 }
@@ -473,6 +490,26 @@ sync_assets() {
   ok "Compose files and configuration templates copied to $data_root"
 }
 
+generate_homepage_configs() {
+  local config_arg=()
+
+  if [[ -n "$CONFIG_FILE" ]]; then
+    config_arg+=("$CONFIG_FILE")
+  fi
+
+  "$SCRIPT_DIR/scripts/generate-homepage-config.sh" "${config_arg[@]}" "${DATA_ROOT:-/srv/lantern}"
+}
+
+bootstrap_authentik() {
+  local config_arg=()
+
+  if [[ -n "$CONFIG_FILE" ]]; then
+    config_arg+=("$CONFIG_FILE")
+  fi
+
+  "$SCRIPT_DIR/scripts/bootstrap-authentik.sh" "${config_arg[@]}"
+}
+
 # =============================================================================
 # PHASE 3: Deploy core stack
 # =============================================================================
@@ -481,32 +518,10 @@ deploy_core() {
 
   local data_root="${DATA_ROOT:-/srv/lantern}"
 
-  log "Starting core stack: traefik → authentik → homepage → uptime-kuma"
-
-  # Deploy in order with health waits
-  log "1/4 — Starting Traefik (reverse proxy)..."
-  docker compose -f "$data_root/stacks/traefik.yml" \
+  log "Starting unified core stack"
+  docker compose -f "$SCRIPT_DIR/compose/docker-compose.core.yml" \
     --env-file "$data_root/stacks/core.env" \
-    --project-name "${COMPOSE_PROJECT_NAME:-lantern}" up -d
-  wait_healthy "traefik" 30
-
-  log "2/4 — Starting Authentik (auth)..."
-  docker compose -f "$data_root/stacks/authentik.yml" \
-    --env-file "$data_root/stacks/core.env" \
-    --project-name "${COMPOSE_PROJECT_NAME:-lantern}" up -d
-  wait_healthy "authentik-server" 60
-
-  log "3/4 — Starting Homepage (dashboard)..."
-  docker compose -f "$data_root/stacks/homepage.yml" \
-    --env-file "$data_root/stacks/core.env" \
-    --project-name "${COMPOSE_PROJECT_NAME:-lantern}" up -d
-  wait_healthy "homepage" 30
-
-  log "4/4 — Starting Uptime Kuma (monitoring)..."
-  docker compose -f "$data_root/stacks/uptime-kuma.yml" \
-    --env-file "$data_root/stacks/core.env" \
-    --project-name "${COMPOSE_PROJECT_NAME:-lantern}" up -d
-  wait_healthy "uptime-kuma" 30
+    --project-name "$PROJECT_NAME" up -d --wait
 
   ok "Core stack deployed"
 }
@@ -518,12 +533,9 @@ deploy_apps() {
   header "Deploying Family Apps"
 
   local data_root="${DATA_ROOT:-/srv/lantern}"
-
-  # Read enabled apps from config and deploy each
-  # This is config-driven — only deploys what's enabled in lantern.yaml
   local enabled_apps=()
+  local app
 
-  # Parse from config (yq-based)
   if [[ -n "$CONFIG_FILE" ]] && command -v yq &>/dev/null; then
     for app in jellyfin immich nextcloud filebrowser mealie paperless; do
       local is_enabled
@@ -539,23 +551,50 @@ deploy_apps() {
     return 0
   fi
 
+  load_app_compose_env "$data_root"
+  export COMPOSE_PROFILES
+  COMPOSE_PROFILES=$(IFS=','; echo "${enabled_apps[*]}")
+
+  log "Deploying unified app stack for profiles: $COMPOSE_PROFILES"
+  docker compose -f "$SCRIPT_DIR/compose/docker-compose.apps.yml" \
+    --project-name "$PROJECT_NAME" up -d --wait
+
   for app in "${enabled_apps[@]}"; do
-    local compose_file="$data_root/stacks/${app}.yml"
-    if [[ -f "$compose_file" ]]; then
-      log "Deploying: $app"
-      generate_app_env "$app"
-      docker compose -f "$compose_file" \
-        --env-file "$data_root/stacks/${app}.env" \
-        --project-name "${COMPOSE_PROJECT_NAME:-lantern}" up -d
-      wait_healthy "$app" 60
-      register_dashboard "$app"
-      ok "Deployed: $app"
-    else
-      warn "Compose file not found for $app — skipping"
-    fi
+    register_dashboard "$app"
+    ok "Deployed: $app"
   done
 
   ok "Family apps deployed"
+}
+
+load_env_file() {
+  local env_path="$1"
+  local line
+  local key
+  local value
+
+  [[ -f "$env_path" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    [[ "$line" =~ ^# ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    export "${key}=${value}"
+  done < "$env_path"
+}
+
+load_app_compose_env() {
+  local data_root="$1"
+  local app
+
+  export DATA_ROOT="$data_root"
+  export TZ="${TIMEZONE:-America/New_York}"
+  export LANTERN_DOMAIN="${DOMAIN:-home.example.com}"
+
+  for app in jellyfin immich nextcloud filebrowser mealie paperless; do
+    load_env_file "$data_root/stacks/${app}.env"
+  done
 }
 
 generate_app_env() {
@@ -605,8 +644,20 @@ BASE_URL=https://recipes.${domain}
 EOF
       ;;
     nextcloud)
+      local admin_username
       cat >> "$env_file" <<EOF
 NEXTCLOUD_TRUSTED_DOMAINS=cloud.${domain} ${domain}
+NEXTCLOUD_DB_NAME=nextcloud
+NEXTCLOUD_DB_USER=nextcloud
+NEXTCLOUD_DB_PASSWORD=$(cat "$data_root/secrets/nextcloud_db_password")
+NEXTCLOUD_DB_ROOT_PASSWORD=$(cat "$data_root/secrets/nextcloud_db_root_password")
+NEXTCLOUD_DB_HOST=nextcloud-mariadb
+NEXTCLOUD_REDIS_HOST=nextcloud-redis
+EOF
+      admin_username=$(config_value '.auth.admin.username' 'admin')
+      cat >> "$env_file" <<EOF
+NEXTCLOUD_ADMIN_USER=${admin_username}
+NEXTCLOUD_ADMIN_PASSWORD=$(cat "$data_root/secrets/admin_password")
 EOF
       ;;
     paperless)
@@ -624,7 +675,7 @@ EOF
 
 register_dashboard() {
   local app="$1"
-  log "Dashboard entry available for $app via the Homepage config templates"
+  log "Dashboard entry available for $app via the generated Homepage config"
 }
 
 # =============================================================================
@@ -682,7 +733,7 @@ validate() {
   # Check all containers are running and healthy
   log "Checking container health..."
   local containers
-  containers=$(docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-lantern}" --format '{{.Names}} {{.Status}}')
+  containers=$(docker ps --filter "label=com.docker.compose.project=${PROJECT_NAME}" --format '{{.Names}} {{.Status}}')
   while IFS= read -r line; do
     local name status
     name=$(echo "$line" | awk '{print $1}')
@@ -745,10 +796,11 @@ print_summary() {
   header "Lantern — Installation Summary"
   local domain="${DOMAIN:-home.example.com}"
   local data_root="${DATA_ROOT:-/srv/lantern}"
+  local password_file="${data_root}/secrets/family_user_passwords"
 
   cat <<EOF
 
-${GREEN}✔ Installation complete!${NC}
+${GREEN}Installation complete.${NC}
 
 ${BOLD}Service URLs:${NC}
   Dashboard:     https://${domain}
@@ -784,19 +836,33 @@ ${BOLD}Admin Info:${NC}
   Config:        ${CONFIG_FILE:-lantern.yaml}
   Install log:   ${LOG_FILE}
 
+${BOLD}Authentik:${NC}
+  Admin email:   $(config_value '.auth.admin.email' "${EMAIL:-admin@example.com}")
+  Apps:          Pre-configured for enabled services
+  User secrets:  ${password_file}
+
 ${BOLD}Next steps:${NC}
   1. Configure DNS — point *.${domain} to this server
-  2. Log into Authentik — set admin password at https://auth.${domain}/if/flow/initial-setup/
-  3. Create family user accounts in Authentik
-  4. Share the dashboard URL with your family
-  5. Verify backups — run: ./scripts/backup.sh --verify
+  2. Share the dashboard URL with your family
+  3. Review family user passwords in ${password_file}
+  4. Verify backups — run: ./scripts/backup.sh --verify
 
-${YELLOW}⚠ Save your secrets!${NC}
+${YELLOW}Save your secrets.${NC}
   Restic password:   ${data_root}/secrets/restic_password
   Admin password:    ${data_root}/secrets/admin_password
   Authentik key:     ${data_root}/secrets/authentik_secret_key
+  API token:         ${data_root}/secrets/authentik_api_token
 
 EOF
+
+  if [[ -f "$password_file" ]]; then
+    echo "${BOLD}Family users:${NC}"
+    while IFS=: read -r username password; do
+      [[ -n "$username" ]] || continue
+      printf '  %s: %s\n' "$username" "$password"
+    done < "$password_file"
+    echo ""
+  fi
 }
 
 # =============================================================================
@@ -834,7 +900,7 @@ wait_healthy() {
 # =============================================================================
 main() {
   echo ""
-  echo -e "${BOLD}  🏠 Lantern Family Server Installer v${LANTERN_VERSION}${NC}"
+  echo -e "${BOLD}  Lantern Family Server Installer v${LANTERN_VERSION}${NC}"
   echo ""
 
   parse_args "$@"
@@ -862,7 +928,9 @@ main() {
       generate_secrets
       generate_env_files
       sync_assets
+      generate_homepage_configs
       deploy_core
+      bootstrap_authentik
       ;;
     apps)
       setup_directories
@@ -879,7 +947,9 @@ main() {
       generate_secrets
       generate_env_files
       sync_assets
+      generate_homepage_configs
       deploy_core
+      bootstrap_authentik
       deploy_apps
       setup_backups
       validate

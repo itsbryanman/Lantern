@@ -1,0 +1,212 @@
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    restart: unless-stopped
+    env_file:
+      - ${DATA_ROOT}/stacks/core.env
+    command:
+      - --api.dashboard=true
+      - --api.insecure=false
+      - --ping=true
+      - --accesslog=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=lantern
+      - --providers.file.directory=/config/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --log.level=${TRAEFIK_LOG_LEVEL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DATA_ROOT}/data/traefik/certs:/certs
+      - ${DATA_ROOT}/configs/traefik/dynamic:/config/dynamic:ro
+    networks:
+      - lantern
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.traefik.rule=Host(`traefik.${LANTERN_DOMAIN}`)
+      - traefik.http.routers.traefik.entrypoints=websecure
+      - traefik.http.routers.traefik.tls.certresolver=letsencrypt
+      - traefik.http.routers.traefik.service=api@internal
+      - traefik.http.routers.traefik.middlewares=default-chain@file
+
+  authentik-postgres:
+    image: postgres:16-alpine
+    container_name: authentik-postgres
+    restart: unless-stopped
+    env_file:
+      - ${DATA_ROOT}/stacks/core.env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ${DATA_ROOT}/data/authentik/postgres:/var/lib/postgresql/data
+    networks:
+      - lantern
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  authentik-redis:
+    image: redis:7-alpine
+    container_name: authentik-redis
+    restart: unless-stopped
+    env_file:
+      - ${DATA_ROOT}/stacks/core.env
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - ${DATA_ROOT}/data/authentik/redis:/data
+    networks:
+      - lantern
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:latest
+    container_name: authentik-server
+    restart: unless-stopped
+    command: server
+    env_file:
+      - ${DATA_ROOT}/stacks/core.env
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__NAME: ${POSTGRES_DB}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    volumes:
+      - ${DATA_ROOT}/data/authentik/media:/media
+      - ${DATA_ROOT}/data/authentik/templates:/templates
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.authentik.rule=Host(`auth.${LANTERN_DOMAIN}`)
+      - traefik.http.routers.authentik.entrypoints=websecure
+      - traefik.http.routers.authentik.tls.certresolver=letsencrypt
+      - traefik.http.routers.authentik.middlewares=default-chain@file
+      - traefik.http.services.authentik.loadbalancer.server.port=9000
+      - traefik.http.routers.authentik-outpost.rule=HostRegexp(`{subdomain:[a-z0-9-]+}.${LANTERN_DOMAIN}`) && PathPrefix(`/outpost.goauthentik.io/`)
+      - traefik.http.routers.authentik-outpost.entrypoints=websecure
+      - traefik.http.routers.authentik-outpost.tls.certresolver=letsencrypt
+      - traefik.http.routers.authentik-outpost.priority=100
+      - traefik.http.routers.authentik-outpost.service=authentik
+      - traefik.http.routers.authentik-outpost.middlewares=default-chain@file
+      - traefik.http.middlewares.authentik-auth.forwardauth.address=http://authentik-server:9000/outpost.goauthentik.io/auth/traefik
+      - traefik.http.middlewares.authentik-auth.forwardauth.trustForwardHeader=true
+      - traefik.http.middlewares.authentik-auth.forwardauth.authResponseHeaders=X-authentik-username,X-authentik-groups,X-authentik-email,X-authentik-name,X-authentik-uid
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:latest
+    container_name: authentik-worker
+    restart: unless-stopped
+    command: worker
+    env_file:
+      - ${DATA_ROOT}/stacks/core.env
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__NAME: ${POSTGRES_DB}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    user: root
+    volumes:
+      - ${DATA_ROOT}/data/authentik/media:/media
+      - ${DATA_ROOT}/data/authentik/certs:/certs
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+    networks:
+      - lantern
+
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    env_file:
+      - ${DATA_ROOT}/stacks/core.env
+    environment:
+      TZ: ${TZ}
+      HOMEPAGE_ALLOWED_HOSTS: ${LANTERN_DOMAIN}
+      HOMEPAGE_VAR_AUTHENTIK_TOKEN_FILE: /run/secrets/authentik_api_token
+      # TODO: Populate post-deploy after the first Jellyfin and Immich runs.
+      HOMEPAGE_VAR_JELLYFIN_TOKEN: ""
+      HOMEPAGE_VAR_IMMICH_TOKEN: ""
+    volumes:
+      - ${DATA_ROOT}/data/homepage:/app/config
+      - ${DATA_ROOT}/data/homepage/images:/app/public/images
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    secrets:
+      - authentik_api_token
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.homepage.rule=Host(`${LANTERN_DOMAIN}`)
+      - traefik.http.routers.homepage.entrypoints=websecure
+      - traefik.http.routers.homepage.tls.certresolver=letsencrypt
+      - traefik.http.routers.homepage.middlewares=default-chain@file
+      - traefik.http.services.homepage.loadbalancer.server.port=3000
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    restart: unless-stopped
+    env_file:
+      - ${DATA_ROOT}/stacks/core.env
+    volumes:
+      - ${DATA_ROOT}/data/uptime-kuma:/app/data
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.uptime-kuma.rule=Host(`status.${LANTERN_DOMAIN}`)
+      - traefik.http.routers.uptime-kuma.entrypoints=websecure
+      - traefik.http.routers.uptime-kuma.tls.certresolver=letsencrypt
+      - traefik.http.routers.uptime-kuma.middlewares=default-chain@file
+      - traefik.http.services.uptime-kuma.loadbalancer.server.port=3001
+
+networks:
+  lantern:
+    name: lantern
+
+secrets:
+  authentik_api_token:
+    file: ${DATA_ROOT}/secrets/authentik_api_token

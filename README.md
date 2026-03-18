@@ -1,4 +1,4 @@
-# 🏠 Lantern
+#  Lantern
 
 **A deployable family server stack — built once, used by everyone.**
 

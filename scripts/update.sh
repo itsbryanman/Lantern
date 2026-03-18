@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# =============================================================================
+# Lantern - Update Helper
+# =============================================================================
+# Usage:
+#   ./scripts/update.sh
+#   ./scripts/update.sh core
+#   ./scripts/update.sh authentik
+#   ./scripts/update.sh jellyfin
+# =============================================================================
 
 set -euo pipefail
 
@@ -6,8 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
-load_lantern_context
-require_command docker
+CORE_COMPOSE_FILE="$LANTERN_REPO_ROOT/compose/docker-compose.core.yml"
+APPS_COMPOSE_FILE="$LANTERN_REPO_ROOT/compose/docker-compose.apps.yml"
 
 show_help() {
   cat <<'EOF'
@@ -15,52 +24,125 @@ Lantern update helper
 
 Usage:
   ./scripts/update.sh
-  ./scripts/update.sh SERVICE
+  ./scripts/update.sh all
+  ./scripts/update.sh core
+  ./scripts/update.sh authentik
+  ./scripts/update.sh jellyfin
 EOF
 }
 
-update_stack() {
-  local name="$1"
-  local env_name="$2"
-  local compose_path
-  local env_path
+load_env_file() {
+  local env_path="$1"
+  local line
+  local key
+  local value
 
-  compose_path="$(stack_file "$name")"
-  env_path="$(env_file "$env_name")"
+  [[ -f "$env_path" ]] || return 0
 
-  [[ -f "$compose_path" ]] || die "Compose file not found: $compose_path"
-  [[ -f "$env_path" ]] || die "Environment file not found: $env_path"
-
-  info "Updating ${name}"
-  docker compose -f "$compose_path" --env-file "$env_path" --project-name "$LANTERN_COMPOSE_PROJECT_NAME" pull
-  docker compose -f "$compose_path" --env-file "$env_path" --project-name "$LANTERN_COMPOSE_PROJECT_NAME" up -d
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    [[ "$line" =~ ^# ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    export "${key}=${value}"
+  done < "$env_path"
 }
 
-case "${1:-}" in
-  "" )
-    update_stack traefik core
-    update_stack authentik core
-    update_stack homepage core
-    update_stack uptime-kuma core
+prepare_app_environment() {
+  local app
 
-    while IFS= read -r app; do
-      [[ -n "$app" ]] || continue
-      update_stack "$app" "$app"
-    done < <(enabled_apps)
-    ;;
-  --help|-h)
-    show_help
-    exit 0
-    ;;
-  traefik|authentik|homepage|uptime-kuma)
-    update_stack "$1" core
-    ;;
-  jellyfin|immich|nextcloud|filebrowser|mealie|paperless)
-    update_stack "$1" "$1"
-    ;;
-  *)
-    die "Unknown service: $1"
-    ;;
-esac
+  export DATA_ROOT="$LANTERN_DATA_ROOT"
+  export TZ="$LANTERN_TIMEZONE"
+  export LANTERN_DOMAIN
 
-info "Update flow completed"
+  for app in jellyfin immich nextcloud filebrowser mealie paperless; do
+    load_env_file "${LANTERN_DATA_ROOT}/stacks/${app}.env"
+  done
+}
+
+run_core_update() {
+  local services=("$@")
+  local compose_args=(
+    docker compose
+    -f "$CORE_COMPOSE_FILE"
+    --env-file "${LANTERN_DATA_ROOT}/stacks/core.env"
+    --project-name lantern
+  )
+
+  log "Updating core services"
+  "${compose_args[@]}" pull "${services[@]}"
+  "${compose_args[@]}" up -d --wait "${services[@]}"
+}
+
+run_apps_update() {
+  local profiles=("$@")
+  local profile_csv
+  local compose_args=(
+    docker compose
+    -f "$APPS_COMPOSE_FILE"
+    --project-name lantern
+  )
+
+  if [[ ${#profiles[@]} -eq 0 ]]; then
+    warn "No app profiles selected for update"
+    return 0
+  fi
+
+  prepare_app_environment
+  profile_csv="$(IFS=','; echo "${profiles[*]}")"
+  export COMPOSE_PROFILES="$profile_csv"
+
+  log "Updating app profiles: ${COMPOSE_PROFILES}"
+  "${compose_args[@]}" pull
+  "${compose_args[@]}" up -d --wait
+}
+
+update_enabled_apps() {
+  local profiles=()
+  local app_name
+
+  while IFS= read -r app_name; do
+    [[ -n "$app_name" ]] || continue
+    profiles+=("$app_name")
+  done < <(enabled_apps)
+
+  run_apps_update "${profiles[@]}"
+}
+
+main() {
+  load_lantern_context
+  require_command docker
+
+  case "${1:-}" in
+    ""|all)
+      run_core_update
+      update_enabled_apps
+      ;;
+    core)
+      run_core_update
+      ;;
+    traefik|homepage|uptime-kuma)
+      run_core_update "$1"
+      ;;
+    authentik)
+      run_core_update authentik-postgres authentik-redis authentik-server authentik-worker
+      ;;
+    apps)
+      update_enabled_apps
+      ;;
+    jellyfin|immich|nextcloud|filebrowser|mealie|paperless)
+      run_apps_update "$1"
+      ;;
+    --help|-h)
+      show_help
+      exit 0
+      ;;
+    *)
+      die "Unknown update target: $1"
+      ;;
+  esac
+
+  ok "Update flow completed"
+}
+
+main "$@"
