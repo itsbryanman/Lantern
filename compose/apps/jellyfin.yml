@@ -1,0 +1,25 @@
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ../data/jellyfin/config:/config
+      - ../data/jellyfin/cache:/cache
+      - ${JELLYFIN_MEDIA_PATH}:/media:ro
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.jellyfin.rule=Host(`media.${LANTERN_DOMAIN}`)
+      - traefik.http.routers.jellyfin.entrypoints=websecure
+      - traefik.http.routers.jellyfin.tls.certresolver=letsencrypt
+      - traefik.http.routers.jellyfin.middlewares=default-chain@file
+      - traefik.http.services.jellyfin.loadbalancer.server.port=8096
+
+networks:
+  lantern:
+    name: lantern

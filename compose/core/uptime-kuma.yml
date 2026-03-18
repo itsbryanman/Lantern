@@ -1,0 +1,21 @@
+services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    restart: unless-stopped
+    volumes:
+      - ../data/uptime-kuma:/app/data
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.uptime-kuma.rule=Host(`status.${LANTERN_DOMAIN}`)
+      - traefik.http.routers.uptime-kuma.entrypoints=websecure
+      - traefik.http.routers.uptime-kuma.tls.certresolver=letsencrypt
+      - traefik.http.routers.uptime-kuma.middlewares=default-chain@file
+      - traefik.http.services.uptime-kuma.loadbalancer.server.port=3001
+
+networks:
+  lantern:
+    name: lantern

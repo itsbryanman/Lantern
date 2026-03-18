@@ -1,0 +1,23 @@
+services:
+  mealie:
+    image: ghcr.io/mealie-recipes/mealie:latest
+    container_name: mealie
+    restart: unless-stopped
+    env_file:
+      - ../stacks/mealie.env
+    volumes:
+      - ../data/mealie/data:/app/data
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.mealie.rule=Host(`recipes.${LANTERN_DOMAIN}`)
+      - traefik.http.routers.mealie.entrypoints=websecure
+      - traefik.http.routers.mealie.tls.certresolver=letsencrypt
+      - traefik.http.routers.mealie.middlewares=default-chain@file
+      - traefik.http.services.mealie.loadbalancer.server.port=9000
+
+networks:
+  lantern:
+    name: lantern

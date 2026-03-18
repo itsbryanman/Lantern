@@ -1,0 +1,26 @@
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      HOMEPAGE_ALLOWED_HOSTS: ${LANTERN_DOMAIN}
+    volumes:
+      - ../configs/homepage:/app/config
+      - ../data/homepage/images:/app/public/images
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.homepage.rule=Host(`${LANTERN_DOMAIN}`)
+      - traefik.http.routers.homepage.entrypoints=websecure
+      - traefik.http.routers.homepage.tls.certresolver=letsencrypt
+      - traefik.http.routers.homepage.middlewares=default-chain@file
+      - traefik.http.services.homepage.loadbalancer.server.port=3000
+
+networks:
+  lantern:
+    name: lantern

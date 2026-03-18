@@ -1,0 +1,79 @@
+services:
+  immich-postgres:
+    image: tensorchord/pgvecto-rs:pg16-v0.3.0
+    container_name: immich-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: immich
+      POSTGRES_USER: immich
+      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD}
+    volumes:
+      - ../data/immich/postgres:/var/lib/postgresql/data
+    networks:
+      - lantern
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U immich -d immich"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  immich-redis:
+    image: redis:7-alpine
+    container_name: immich-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - ../data/immich/redis:/data
+    networks:
+      - lantern
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    container_name: immich-machine-learning
+    restart: unless-stopped
+    volumes:
+      - ../data/immich/model-cache:/cache
+    networks:
+      - lantern
+
+  immich:
+    image: ghcr.io/immich-app/immich-server:release
+    container_name: immich
+    restart: unless-stopped
+    env_file:
+      - ../stacks/immich.env
+    environment:
+      DB_HOSTNAME: immich-postgres
+      DB_DATABASE_NAME: immich
+      DB_USERNAME: immich
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD}
+      REDIS_HOSTNAME: immich-redis
+      IMMICH_MACHINE_LEARNING_URL: http://immich-machine-learning:3003
+    volumes:
+      - ${UPLOAD_LOCATION}:/usr/src/app/upload
+      - ../data/immich/cache:/cache
+      - ${IMMICH_EXTERNAL_LIBRARY}:/external:ro
+    depends_on:
+      immich-postgres:
+        condition: service_healthy
+      immich-redis:
+        condition: service_healthy
+    networks:
+      - lantern
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=lantern
+      - traefik.http.routers.immich.rule=Host(`photos.${LANTERN_DOMAIN}`)
+      - traefik.http.routers.immich.entrypoints=websecure
+      - traefik.http.routers.immich.tls.certresolver=letsencrypt
+      - traefik.http.routers.immich.middlewares=default-chain@file
+      - traefik.http.services.immich.loadbalancer.server.port=2283
+
+networks:
+  lantern:
+    name: lantern

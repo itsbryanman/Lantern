@@ -1,0 +1,21 @@
+http:
+  middlewares:
+    gzip:
+      compress: {}
+    security-headers:
+      headers:
+        browserXssFilter: true
+        contentTypeNosniff: true
+        customFrameOptionsValue: SAMEORIGIN
+        forceSTSHeader: true
+        permissionsPolicy: camera=(), microphone=(), geolocation=()
+        referrerPolicy: strict-origin-when-cross-origin
+        sslRedirect: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+    default-chain:
+      chain:
+        middlewares:
+          - gzip
+          - security-headers

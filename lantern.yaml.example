@@ -1,0 +1,136 @@
+# =============================================================================
+# Lantern — Family Server Configuration
+# =============================================================================
+# Copy this file to lantern.yaml and edit to match your setup.
+# The install script reads this file to generate all compose files, env vars,
+# secrets, and dashboard entries automatically.
+# =============================================================================
+
+# ── Server identity ──────────────────────────────────────────────────────────
+server:
+  name: "Our Family Server"           # Shown on dashboard
+  domain: "home.example.com"          # Your domain (or use .local for LAN-only)
+  timezone: "America/New_York"
+  email: "admin@example.com"          # Used for Let's Encrypt + alerts
+  data_root: "/srv/lantern"         # Where all data lives on disk
+
+# ── Networking ───────────────────────────────────────────────────────────────
+network:
+  mode: "local"                       # "local" = LAN only, "public" = internet-facing
+  tailscale:
+    enabled: false                    # Tailscale for secure remote access
+    authkey: ""                       # Pre-auth key (or leave blank for interactive)
+  tls:
+    provider: "letsencrypt"           # "letsencrypt", "selfsigned", or "none"
+    acme_email: ""                    # Falls back to server.email if blank
+
+# ── Users & auth ─────────────────────────────────────────────────────────────
+auth:
+  admin:
+    username: "admin"
+    email: ""                         # Falls back to server.email
+    # Password auto-generated at install, stored in secrets/
+  family_users:
+    - name: "Partner"
+      email: "partner@example.com"
+      group: "family"
+    - name: "Kid1"
+      email: ""                       # Optional — skip for young kids
+      group: "family"
+  groups:
+    - name: "admin"
+      dashboard_board: "admin"
+    - name: "family"
+      dashboard_board: "home"
+
+# ── Apps to deploy ───────────────────────────────────────────────────────────
+# Set enabled: true/false per app. The install script only deploys what you pick.
+apps:
+
+  # ── Media ──
+  jellyfin:
+    enabled: true
+    category: "media"
+    label: "Movies & TV"
+    media_path: "/mnt/media"          # Your existing media library path
+    visibility: ["family", "admin"]
+
+  # ── Photos ──
+  immich:
+    enabled: true
+    category: "photos"
+    label: "Photos"
+    upload_path: ""                   # Defaults to ${data_root}/immich/upload
+    external_library: ""              # Optional: path to existing photo library
+    visibility: ["family", "admin"]
+
+  # ── Files ──
+  nextcloud:
+    enabled: false                    # Full-featured, heavier
+    category: "files"
+    label: "Family Cloud"
+    visibility: ["family", "admin"]
+
+  filebrowser:
+    enabled: true                     # Lightweight alternative
+    category: "files"
+    label: "Files"
+    root_path: ""                     # Defaults to ${data_root}/files/shared
+    visibility: ["family", "admin"]
+
+  # ── Recipes ──
+  mealie:
+    enabled: true
+    category: "home"
+    label: "Recipes"
+    visibility: ["family", "admin"]
+
+  # ── Documents ──
+  paperless:
+    enabled: false
+    category: "docs"
+    label: "Documents"
+    consume_path: ""                  # Folder to watch for new scans
+    visibility: ["admin"]             # Family sees it only if you want
+
+# ── Backups ──────────────────────────────────────────────────────────────────
+backups:
+  enabled: true
+  tool: "restic"
+  schedule: "0 2 * * *"              # Cron: 2 AM daily
+  retention:
+    keep_daily: 7
+    keep_weekly: 4
+    keep_monthly: 6
+  destinations:
+    - type: "local"
+      path: "/mnt/backups/lantern"
+    # - type: "s3"
+    #   bucket: "my-family-backups"
+    #   endpoint: ""
+    #   access_key: ""
+    #   secret_key: ""
+  verify:
+    enabled: true
+    schedule: "0 6 * * 0"            # Weekly restore test, Sunday 6 AM
+
+# ── Monitoring & alerts ──────────────────────────────────────────────────────
+monitoring:
+  uptime_kuma:
+    enabled: true
+  grafana:
+    enabled: false                    # Enable if you want deep metrics
+  notifications:
+    method: "discord"                 # "discord", "telegram", "email", "slack", "ntfy"
+    webhook_url: ""                   # For Discord/Slack
+    # telegram_bot_token: ""
+    # telegram_chat_id: ""
+
+# ── Advanced ─────────────────────────────────────────────────────────────────
+advanced:
+  compose_project_name: "lantern"
+  fail2ban: true
+  auto_updates:
+    enabled: false                    # Auto-pull new images on schedule
+    schedule: "0 4 * * 0"            # Sunday 4 AM
+  log_retention_days: 30
